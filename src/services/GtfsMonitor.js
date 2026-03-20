@@ -1,5 +1,8 @@
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
 import { config } from '../config/config.js';
+import logger from '../lib/logger.js';
+
+const log = logger.child({ service: 'gtfs-monitor' });
 
 class GtfsMonitor {
     constructor() {
@@ -9,6 +12,11 @@ class GtfsMonitor {
         this.lastAlertsUpdate = null;
         this.tripsError = null;
         this.alertsError = null;
+
+        this._tripsTimeout = null;
+        this._alertsTimeout = null;
+        this._tripsInFlight = false;
+        this._alertsInFlight = false;
 
         // Status tracking
         this.isPolling = false;
@@ -24,22 +32,48 @@ class GtfsMonitor {
         if (this.isPolling) return;
         this.isPolling = true;
 
-        // Initial fetch
-        this.updateTrips();
-        this.updateAlerts();
+        // Initial fetch with error handling
+        this._pollTrips();
+        this._pollAlerts();
 
-        // Start polling intervals
-        this.tripsInterval = setInterval(() => this.updateTrips(), config.refreshInterval);
-        this.alertsInterval = setInterval(() => this.updateAlerts(), config.refreshInterval * 2); // Alerts change less often
-
-        console.log('GTFS Real-time monitor started');
+        log.info('GTFS Real-time monitor started');
     }
 
     stop() {
-        clearInterval(this.tripsInterval);
-        clearInterval(this.alertsInterval);
         this.isPolling = false;
-        console.log('GTFS Real-time monitor stopped');
+        clearTimeout(this._tripsTimeout);
+        clearTimeout(this._alertsTimeout);
+        log.info('GTFS Real-time monitor stopped');
+    }
+
+    async _pollTrips() {
+        if (!this.isPolling || this._tripsInFlight) return;
+        this._tripsInFlight = true;
+        try {
+            await this.updateTrips();
+        } catch (err) {
+            log.error({ err }, 'Unhandled error in trips poll');
+        } finally {
+            this._tripsInFlight = false;
+            if (this.isPolling) {
+                this._tripsTimeout = setTimeout(() => this._pollTrips(), config.refreshInterval);
+            }
+        }
+    }
+
+    async _pollAlerts() {
+        if (!this.isPolling || this._alertsInFlight) return;
+        this._alertsInFlight = true;
+        try {
+            await this.updateAlerts();
+        } catch (err) {
+            log.error({ err }, 'Unhandled error in alerts poll');
+        } finally {
+            this._alertsInFlight = false;
+            if (this.isPolling) {
+                this._alertsTimeout = setTimeout(() => this._pollAlerts(), config.refreshInterval * 2);
+            }
+        }
     }
 
     async fetchFeed(url, type) {
@@ -63,7 +97,6 @@ class GtfsMonitor {
                 clearTimeout(timeoutId);
 
                 if (!response.ok) {
-                    // If 500/502/503/504, it might be temporary.
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
 
@@ -78,11 +111,9 @@ class GtfsMonitor {
                 lastError = error;
                 const isLastAttempt = attempt === retries;
 
-                // Log warning but don't spam if it's just a transient issue that resolves
-                console.warn(`Attempt ${attempt}/${retries} failed for ${type}: ${error.message}`);
+                log.warn({ attempt, retries, type, err: error.message }, 'Feed fetch attempt failed');
 
                 if (!isLastAttempt) {
-                    // Exponential backoff: 1s, 2s, 4s
                     const delay = 1000 * Math.pow(2, attempt - 1);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
@@ -99,12 +130,10 @@ class GtfsMonitor {
             this.lastTripsUpdate = new Date();
             this.tripsError = null;
             this.stats.tripUpdates++;
-            // console.log(`Trips updated at ${this.lastTripsUpdate.toISOString()}`);
         } catch (error) {
             this.tripsError = error;
             this.stats.tripErrors++;
-            console.error(`Failed to update trips feed: ${error.message}`);
-            // We keep the stale data logic handled by the getter (checking timestamps)
+            log.error({ err: error.message }, 'Failed to update trips feed');
         }
     }
 
@@ -118,16 +147,12 @@ class GtfsMonitor {
         } catch (error) {
             this.alertsError = error;
             this.stats.alertErrors++;
-            console.error(`Failed to update alerts feed: ${error.message}`);
+            log.error({ err: error.message }, 'Failed to update alerts feed');
         }
     }
 
     getTrips() {
-        // Return null if no data ever loaded
         if (!this.tripsFeed) return null;
-
-        // Optional: Return null if data is too stale (e.g. > 5 mins)
-        // For now we return what we have but maybe add a 'stale' flag in the consumer
         return this.tripsFeed;
     }
 

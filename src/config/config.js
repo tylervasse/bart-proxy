@@ -6,6 +6,7 @@ const __dirname = dirname(__filename);
 const rootDir = join(__dirname, '../../');
 
 export const config = {
+  logLevel: process.env.LOG_LEVEL || 'info',
   feeds: {
     trips: process.env.BART_TRIPS_URL || "https://api.bart.gov/gtfsrt/tripupdate.aspx",
     alerts: process.env.BART_ALERTS_URL || "https://api.bart.gov/gtfsrt/alerts.aspx",

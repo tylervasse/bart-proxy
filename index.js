@@ -5,12 +5,24 @@ import { config } from './src/config/config.js';
 import { staticDataService } from './src/services/StaticDataService.js';
 import { gtfsMonitor } from './src/services/GtfsMonitor.js';
 import { transitService } from './src/services/TransitService.js';
-
 import { gtfsUpdater } from './src/services/GtfsUpdater.js';
+import logger from './src/lib/logger.js';
+
+const VALID_DIRECTIONS = new Set(['eastbound', 'westbound']);
 
 // Initialize Express app
 const app = express();
 app.use(express.json());
+
+let isShuttingDown = false;
+
+// Connection draining middleware
+app.use((req, res, next) => {
+  if (isShuttingDown) {
+    res.set('Connection', 'close');
+  }
+  next();
+});
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -26,7 +38,6 @@ app.get('/', (req, res) => {
       '/update': 'Trigger manual GTFS update (admin)'
     },
     configuration: {
-      // ...
       station: config.station,
       feeds: {
         trips: config.feeds.trips,
@@ -39,12 +50,14 @@ app.get('/', (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
   const status = gtfsMonitor.getStatus();
-  const isHealthy = !status.trips.error || !!status.trips.hasData;
+  const tripsAge = status.trips.lastUpdate
+    ? Date.now() - status.trips.lastUpdate.getTime()
+    : Infinity;
 
-  const responseCode = isHealthy ? 200 : 503;
+  const isHealthy = status.trips.hasData && tripsAge < 300_000; // 5 min
 
-  res.status(responseCode).json({
-    status: isHealthy ? 'healthy' : 'unhealthy',
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     monitor: status,
     staticDataLoaded: staticDataService.getStats()
@@ -59,7 +72,10 @@ app.get('/status', (req, res) => {
 // Get configured station info
 app.get('/station', async (req, res) => {
   try {
-    const direction = req.query.direction || config.station.direction;
+    const direction = req.query.direction?.toLowerCase() || config.station.direction;
+    if (req.query.direction && !VALID_DIRECTIONS.has(direction)) {
+      return res.status(400).json({ error: 'Invalid direction. Use "eastbound" or "westbound".' });
+    }
     const stopInfo = await transitService.getStopInfo(config.station.id, direction);
     res.json(stopInfo);
   } catch (error) {
@@ -74,7 +90,10 @@ app.get('/station', async (req, res) => {
 app.get('/station/:stopId', async (req, res) => {
   try {
     const stopId = req.params.stopId;
-    const direction = req.query.direction || null;
+    const direction = req.query.direction?.toLowerCase() || null;
+    if (direction && !VALID_DIRECTIONS.has(direction)) {
+      return res.status(400).json({ error: 'Invalid direction. Use "eastbound" or "westbound".' });
+    }
     const stopInfo = await transitService.getStopInfo(stopId, direction);
     res.json(stopInfo);
   } catch (error) {
@@ -90,14 +109,15 @@ app.get('/station/:stopId', async (req, res) => {
 app.get('/next', async (req, res) => {
   try {
     const stopId = req.query.stop || config.station.id;
-    const direction = req.query.direction || config.station.direction;
-    const limit = parseInt(req.query.limit) || 4;
+    const direction = req.query.direction?.toLowerCase() || config.station.direction;
+    if (req.query.direction && !VALID_DIRECTIONS.has(direction)) {
+      return res.status(400).json({ error: 'Invalid direction. Use "eastbound" or "westbound".' });
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 4, 1), 20);
 
-    // Note: getStopInfo might throw if stopId is invalid
     const stopInfo = await transitService.getStopInfo(stopId, direction);
 
     const nextArrivals = stopInfo.upcomingTrips.slice(0, limit).map(trip => {
-      // Extract destination: split by " / " and take the last part
       let destination = trip.headsign;
       if (destination) {
         const parts = destination.split(' / ');
@@ -108,7 +128,6 @@ app.get('/next', async (req, res) => {
         destination = "Unknown";
       }
 
-      // Determine status based on minutes until arrival
       const status = trip.minutesUntilArrival <= 1 ? 'arriving' : 'scheduled';
 
       const arrival = {
@@ -117,7 +136,6 @@ app.get('/next', async (req, res) => {
         status: status
       };
 
-      // Add car/vehicle information if available
       if (trip.vehicleLabel) {
         arrival.vehicle = trip.vehicleLabel;
       }
@@ -172,12 +190,12 @@ async function startServer() {
     // Download GTFS data if not present
     const stopsFile = join(config.paths.staticData, 'stops.txt');
     if (!existsSync(stopsFile)) {
-      console.log('No GTFS static data found. Downloading...');
+      logger.info('No GTFS static data found. Downloading...');
       await gtfsUpdater.checkForUpdates();
     }
 
     // Load Static Data
-    staticDataService.load();
+    await staticDataService.load();
 
     // Start GTFS Monitor (Background polling)
     gtfsMonitor.start();
@@ -186,38 +204,41 @@ async function startServer() {
     gtfsUpdater.start();
 
     const server = app.listen(config.port, config.host, () => {
-      console.log(`\n🚇 BART GTFS Real-time API Server`);
-      console.log(`📍 Station: ${config.station.id} (${staticDataService.getStop(config.station.id)?.stop_name || 'Unknown'})`);
-      console.log(`🧭 Direction: ${config.station.direction}`);
-      console.log(`🌐 Server running on http://${config.host}:${config.port}`);
-      console.log(`\nAvailable endpoints:`);
-      console.log(`  GET /                - API information`);
-      console.log(`  GET /station         - Configured station info`);
-      console.log(`  GET /station/:stopId - Any station info`);
-      console.log(`  GET /next            - Next 4 arrivals (simplified)`);
-      console.log(`  GET /stops           - List all stops`);
-      console.log(`  GET /health          - Health check`);
-      console.log(`  GET /status          - Monitor status\n`);
+      logger.info({
+        station: config.station.id,
+        stationName: staticDataService.getStop(config.station.id)?.stop_name,
+        direction: config.station.direction,
+        url: `http://${config.host}:${config.port}`
+      }, 'BART GTFS Real-time API server started');
     });
 
     function shutdown(signal) {
-      console.log(`\n${signal} received. Shutting down gracefully...`);
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      logger.info({ signal }, 'Shutting down gracefully');
       gtfsMonitor.stop();
       gtfsUpdater.stop();
       server.close(() => {
-        console.log('Server closed.');
+        logger.info('Server closed');
         process.exit(0);
       });
       setTimeout(() => {
-        console.error('Forced shutdown after timeout.');
+        logger.error('Forced shutdown after timeout');
         process.exit(1);
-      }, 5000);
+      }, 10_000);
     }
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('unhandledRejection', (reason) => {
+      logger.error({ err: reason }, 'Unhandled rejection');
+    });
+    process.on('uncaughtException', (err) => {
+      logger.fatal({ err }, 'Uncaught exception, shutting down');
+      shutdown('uncaughtException');
+    });
   } catch (e) {
-    console.error("Failed to start server:", e);
+    logger.fatal({ err: e }, 'Failed to start server');
     process.exit(1);
   }
 }

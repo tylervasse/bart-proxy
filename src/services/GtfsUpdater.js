@@ -1,108 +1,127 @@
-import fs from 'fs';
 import path from 'path';
 import AdmZip from 'adm-zip';
 import { config } from '../config/config.js';
 import { staticDataService } from './StaticDataService.js';
+import logger from '../lib/logger.js';
+
+const log = logger.child({ service: 'gtfs-updater' });
 
 class GtfsUpdater {
     constructor() {
-        // BART Developer License URL that often redirects or contains links
         this.bartUrl = 'https://www.bart.gov/dev/schedules/google_transit.zip';
         this.isUpdating = false;
         this.lastUpdate = null;
+        this._interval = null;
     }
 
     start() {
         // Check daily
-        this.interval = setInterval(() => this.checkForUpdates(), 24 * 60 * 60 * 1000);
-        console.log('GTFS Updater service started (Daily checks)');
+        this._interval = setInterval(() => this.checkForUpdates(), 24 * 60 * 60 * 1000);
+        log.info('GTFS Updater service started (daily checks)');
     }
 
     stop() {
-        clearInterval(this.interval);
-        console.log('GTFS Updater service stopped');
+        clearInterval(this._interval);
+        log.info('GTFS Updater service stopped');
     }
 
     async checkForUpdates() {
         if (this.isUpdating) return;
         this.isUpdating = true;
-        console.log('Checking for GTFS updates...');
+        log.info('Checking for GTFS updates...');
 
         try {
-            // 1. Get the actual download URL
             const downloadUrl = await this._resolveDownloadUrl(this.bartUrl);
             if (!downloadUrl) {
                 throw new Error('Could not resolve GTFS download URL');
             }
-            console.log(`Resolved GTFS URL: ${downloadUrl}`);
+            log.info({ url: downloadUrl }, 'Resolved GTFS URL');
 
-            // 2. Download the file
             const zipBuffer = await this._downloadFile(downloadUrl);
-
-            // 3. Process the update
             await this._processUpdate(zipBuffer);
 
             this.lastUpdate = new Date();
-            console.log('GTFS update completed successfully');
-
+            log.info('GTFS update completed successfully');
         } catch (error) {
-            console.error('GTFS Update failed:', error.message);
+            log.error({ err: error.message }, 'GTFS update failed');
         } finally {
             this.isUpdating = false;
         }
     }
 
     async _resolveDownloadUrl(initialUrl) {
-        const response = await fetch(initialUrl); // standard fetch follows 3xx
-        const text = await response.text();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60_000);
+        try {
+            const response = await fetch(initialUrl, { signal: controller.signal });
+            const text = await response.text();
 
-        // Check for client-side meta refresh which BART uses
-        // <meta http-equiv="refresh" content="0;url='...'" />
-        const match = text.match(/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'][^"']*url=['"]?([^'"\s>]+)['"]?/i);
+            const match = text.match(/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'][^"']*url=['"]?([^'"\s>]+)['"]?/i);
 
-        if (match && match[1]) {
-            let redirectUrl = match[1];
-            // Handle relative URLs if necessary, though BART usually gives absolute
-            if (redirectUrl.startsWith('/')) {
-                const u = new URL(initialUrl);
-                redirectUrl = `${u.protocol}//${u.host}${redirectUrl}`;
+            if (match && match[1]) {
+                let redirectUrl = match[1];
+                if (redirectUrl.startsWith('/')) {
+                    const u = new URL(initialUrl);
+                    redirectUrl = `${u.protocol}//${u.host}${redirectUrl}`;
+                }
+                return redirectUrl;
             }
-            return redirectUrl;
-        }
 
-        // If it was a direct download (binary content), fetch response.url would be the final url
-        // and headers content-type would be zip.
-        const contentType = response.headers.get('content-type');
-        if (contentType && (contentType.includes('zip') || contentType.includes('octet-stream'))) {
-            return response.url;
-        }
+            const contentType = response.headers.get('content-type');
+            if (contentType && (contentType.includes('zip') || contentType.includes('octet-stream'))) {
+                return response.url;
+            }
 
-        return null;
+            return null;
+        } finally {
+            clearTimeout(timeoutId);
+        }
     }
 
-    async _downloadFile(url) {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
-        return await response.arrayBuffer();
+    async _downloadFile(url, retries = 3) {
+        let lastError;
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 120_000);
+            try {
+                const response = await fetch(url, { signal: controller.signal });
+                clearTimeout(timeoutId);
+                if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
+                return await response.arrayBuffer();
+            } catch (err) {
+                clearTimeout(timeoutId);
+                lastError = err;
+                log.warn({ attempt, retries, err: err.message }, 'GTFS download attempt failed');
+                if (attempt < retries) {
+                    await new Promise(r => setTimeout(r, 5000 * Math.pow(2, attempt - 1)));
+                }
+            }
+        }
+        throw lastError;
     }
 
     async _processUpdate(arrayBuffer) {
         const buffer = Buffer.from(arrayBuffer);
         const zip = new AdmZip(buffer);
 
-        // Validate zip has essential files
         if (!zip.getEntry('trips.txt') || !zip.getEntry('stops.txt')) {
             throw new Error('Invalid GTFS zip: missing required files');
         }
 
-        const targetDir = config.paths.staticData;
+        const targetDir = path.resolve(config.paths.staticData);
 
-        // Extract directly into the target directory (may be a bind mount, so can't rename it)
-        console.log(`Extracting to ${targetDir}...`);
+        // Validate no path traversal
+        for (const entry of zip.getEntries()) {
+            const resolvedPath = path.resolve(targetDir, entry.entryName);
+            if (!resolvedPath.startsWith(targetDir + path.sep) && resolvedPath !== targetDir) {
+                throw new Error(`Zip entry escapes target directory: ${entry.entryName}`);
+            }
+        }
+
+        log.info({ targetDir }, 'Extracting GTFS data');
         zip.extractAllTo(targetDir, true);
 
-        // Reload services
-        staticDataService.reload();
+        await staticDataService.reload();
     }
 }
 

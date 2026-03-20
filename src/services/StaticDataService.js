@@ -1,7 +1,10 @@
-import { parse } from 'csv-parse/sync';
-import { readFileSync } from 'fs';
+import { parse } from 'csv-parse';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { config } from '../config/config.js';
+import logger from '../lib/logger.js';
+
+const log = logger.child({ service: 'static-data' });
 
 class StaticDataService {
     constructor() {
@@ -12,63 +15,68 @@ class StaticDataService {
         this.initialized = false;
     }
 
-    load() {
+    async _parseFile(filename) {
+        const content = await readFile(join(config.paths.staticData, filename), 'utf-8');
+        return new Promise((resolve, reject) => {
+            parse(content, { columns: true, skip_empty_lines: true }, (err, records) => {
+                if (err) reject(err);
+                else resolve(records);
+            });
+        });
+    }
+
+    async load() {
         if (this.initialized) return;
 
         try {
-            console.log('Loading static GTFS data...');
+            log.info('Loading static GTFS data...');
+
+            const newStops = new Map();
+            const newRoutes = new Map();
+            const newTrips = new Map();
+            const newStopTimes = new Map();
 
             // Load stops
-            const stopsContent = readFileSync(join(config.paths.staticData, 'stops.txt'), 'utf-8');
-            const stops = parse(stopsContent, { columns: true, skip_empty_lines: true });
-            stops.forEach(stop => {
-                this.stops.set(stop.stop_id, stop);
-            });
-            console.log(`Loaded ${this.stops.size} stops`);
+            const stops = await this._parseFile('stops.txt');
+            stops.forEach(stop => newStops.set(stop.stop_id, stop));
+            log.info({ count: newStops.size }, 'Loaded stops');
 
             // Load routes
-            const routesContent = readFileSync(join(config.paths.staticData, 'routes.txt'), 'utf-8');
-            const routes = parse(routesContent, { columns: true, skip_empty_lines: true });
-            routes.forEach(route => {
-                this.routes.set(route.route_id, route);
-            });
-            console.log(`Loaded ${this.routes.size} routes`);
+            const routes = await this._parseFile('routes.txt');
+            routes.forEach(route => newRoutes.set(route.route_id, route));
+            log.info({ count: newRoutes.size }, 'Loaded routes');
 
             // Load trips
-            const tripsContent = readFileSync(join(config.paths.staticData, 'trips.txt'), 'utf-8');
-            const trips = parse(tripsContent, { columns: true, skip_empty_lines: true });
-            trips.forEach(trip => {
-                this.trips.set(trip.trip_id, trip);
-            });
-            console.log(`Loaded ${this.trips.size} trips`);
+            const trips = await this._parseFile('trips.txt');
+            trips.forEach(trip => newTrips.set(trip.trip_id, trip));
+            log.info({ count: newTrips.size }, 'Loaded trips');
 
             // Load stop_times and index by trip_id
-            // This can be large, so we might want to optimize if memory is an issue
-            const stopTimesContent = readFileSync(join(config.paths.staticData, 'stop_times.txt'), 'utf-8');
-            const stopTimes = parse(stopTimesContent, { columns: true, skip_empty_lines: true });
+            const stopTimes = await this._parseFile('stop_times.txt');
             stopTimes.forEach(stopTime => {
-                if (!this.stopTimes.has(stopTime.trip_id)) {
-                    this.stopTimes.set(stopTime.trip_id, []);
+                if (!newStopTimes.has(stopTime.trip_id)) {
+                    newStopTimes.set(stopTime.trip_id, []);
                 }
-                this.stopTimes.get(stopTime.trip_id).push(stopTime);
+                newStopTimes.get(stopTime.trip_id).push(stopTime);
             });
-            console.log(`Loaded stop times for ${this.stopTimes.size} trips`);
+            log.info({ count: newStopTimes.size }, 'Loaded stop times');
 
+            // Atomic swap
+            this.stops = newStops;
+            this.routes = newRoutes;
+            this.trips = newTrips;
+            this.stopTimes = newStopTimes;
             this.initialized = true;
         } catch (error) {
-            console.error('Error loading static GTFS data:', error);
+            log.error({ err: error }, 'Error loading static GTFS data');
             throw error;
         }
     }
 
-    reload() {
-        console.log('Reloading static data...');
-        this.stops.clear();
-        this.routes.clear();
-        this.trips.clear();
-        this.stopTimes.clear();
+    async reload() {
+        log.info('Reloading static data...');
         this.initialized = false;
-        this.load();
+        await this.load();
     }
 
     getStop(stopId) {
