@@ -213,15 +213,6 @@ Once both components are running:
 
 ---
 
-## Future Work
-
-* Multi-station cycling on device
-* Remote configuration interface
-* Over-the-air firmware updates
-* Cloud-hosted server deployment
-* Improved display formatting and animation
-
----
 
 ## Summary
 
